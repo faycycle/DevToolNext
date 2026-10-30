@@ -3,15 +3,20 @@ import logging
 import queue
 import threading
 import time
+import uuid
 
+from . import __version__
+from .connectors import open_stream
 from .serial_plugin import SerialPlugin
-from .storage import SessionStore
+from .sessionlog import SessionLog, describe_target
+from .storage import SessionStore, public_config
 
 log = logging.getLogger(__name__)
 
 READ_CHUNK = 4096      # 单次驱动读取上限
 MERGE_LIMIT = 16384    # 一次合并入队的原始字节上限
 QUEUE_SIZE = 1024
+FLUSH_INTERVAL = 0.025   # 批次落库/推送间隔，决定画面更新频率
 
 
 class DeviceService:
@@ -20,6 +25,7 @@ class DeviceService:
         self.plugin = plugin or SerialPlugin()
         self.lifecycle = threading.RLock()
         self.state_lock = threading.Lock()
+        self.cid = uuid.uuid4().hex
         self.io = None
         self.sid = None
         self.error = None
@@ -27,34 +33,81 @@ class DeviceService:
         self.state = "disconnected"
         self.rx = self.tx = 0
         self.reader = self.writer = None
+        self.session_log = None
+        self.last_log_file = None
+        self.changed = threading.Condition()
         self.stop = threading.Event()
         self.reader_done = threading.Event()
-        self.pending = queue.Queue(maxsize=1024)
+        self.pending = queue.Queue(maxsize=QUEUE_SIZE)
 
     def status(self):
+        lines = self._lines()
         with self.state_lock:
             return dict(state=self.state, session_id=self.sid, error=self.error,
                         config=self.config, rx_bytes=self.rx, tx_bytes=self.tx,
+                        log_file=str(self.session_log.path) if self.session_log else self.last_log_file,
+                        dtr=lines.get("dtr"), rts=lines.get("rts"),
                         capabilities=list(self.plugin.capabilities))
 
+    def _lines(self):
+        io = self.io
+        if io is None:
+            return {}
+        try:
+            return {"dtr": bool(io.dtr), "rts": bool(io.rts)}
+        except Exception:
+            return {}
+
+    def set_lines(self, dtr=None, rts=None):
+        """Drive DTR/RTS manually; many boards reset on a DTR toggle."""
+        with self.lifecycle:
+            if self.state != "connected" or self.io is None:
+                raise RuntimeError("设备未连接")
+            if dtr is None and rts is None:
+                raise ValueError("请指定 DTR 或 RTS")
+            if not hasattr(self.io, "dtr"):
+                raise ValueError("该连接类型不支持 DTR/RTS")
+            try:
+                if dtr is not None:
+                    self.io.dtr = bool(dtr)
+                if rts is not None:
+                    self.io.rts = bool(rts)
+            except Exception as exc:
+                self._fail(f"设置 DTR/RTS 失败：{exc}")
+                raise
+            lines = self._lines()
+            log.info("线路状态 session=%s %s", self.sid, lines)
+            self.notify()
+            return lines
+
     def connect(self, config):
+        config = dict(config or {})
+        public = public_config(config)
         with self.lifecycle:
             self.disconnect()
             with self.state_lock:
                 self.state, self.error = "connecting", None
             try:
-                port = self.plugin.open(config)
-                try:
-                    sid = self.store.begin(config)
-                except Exception:
-                    port.close()
-                    raise
+                port = open_stream(config, self.plugin)
             except Exception as exc:
                 log.warning("连接失败 port=%s: %s", config.get("port"), exc)
                 self._fail(str(exc))
                 raise
-            self.io, self.sid = port, sid
-            self.config = config
+            sid = uuid.uuid4().hex
+            try:
+                session_log = SessionLog(self.store.output_dir(), sid, public, __version__,
+                                         keep_raw=self.store.get_setting("keep_raw", "1") != "0")
+                self.store.begin(public, sid)
+            except Exception as exc:
+                try:
+                    port.close()
+                except Exception:
+                    log.warning("关闭端口失败", exc_info=True)
+                log.warning("会话初始化失败 port=%s: %s", config.get("port"), exc)
+                self._fail(str(exc))
+                raise
+            self.io, self.sid, self.session_log = port, sid, session_log
+            self.config = public
             self.rx = self.tx = 0
             self.pending = queue.Queue(maxsize=QUEUE_SIZE)
             self.stop.clear()
@@ -65,7 +118,8 @@ class DeviceService:
             self.reader = threading.Thread(target=self._read, name="serial-reader", daemon=True)
             self.writer.start()
             self.reader.start()
-            log.info("已连接 port=%s session=%s", config.get("port"), sid)
+            log.info("已连接 port=%s session=%s log=%s", config.get("port"), sid, session_log.path)
+            self.notify()
             return self.status()
 
     def _fail(self, message):
@@ -76,6 +130,7 @@ class DeviceService:
             self.state = "fault"
         log.error("%s", message)
         self.stop.set()
+        self.notify()
 
     def _record(self, direction, data):
         try:
@@ -117,7 +172,7 @@ class DeviceService:
         try:
             while not self.reader_done.is_set() or not self.pending.empty():
                 try:
-                    batch = [self.pending.get(timeout=0.1)]
+                    batch = [self.pending.get(timeout=FLUSH_INTERVAL)]
                 except queue.Empty:
                     continue
                 while len(batch) < 128:
@@ -125,9 +180,24 @@ class DeviceService:
                         batch.append(self.pending.get_nowait())
                     except queue.Empty:
                         break
-                self.store.append_batch(batch)
+                self._persist(batch)
         except Exception as exc:
             self._fail(f"录制写入失败，会话不完整：{exc}")
+
+    def _persist(self, batch):
+        # The JSONL file is the durable artifact; the database only backs the live view.
+        if self.session_log is not None:
+            try:
+                self.session_log.append(batch)
+            except Exception as exc:
+                raise RuntimeError(f"日志文件写入失败：{exc}") from exc
+        self.store.append_batch(batch)
+        self.notify()
+
+    def notify(self):
+        """Wake long-poll readers as soon as a batch is queryable."""
+        with self.changed:
+            self.changed.notify_all()
 
     def send(self, data):
         if not data:
@@ -174,6 +244,13 @@ class DeviceService:
                 if self.writer.is_alive():
                     stuck.append("录制线程")
             self._close_io()
+            if self.session_log is not None:
+                self.last_log_file = str(self.session_log.path)
+                try:
+                    self.session_log.close(self.error is None, self.error)
+                except Exception:
+                    log.exception("关闭会话日志失败 session=%s", self.sid)
+                self.session_log = None
             if self.sid:
                 try:
                     self.store.finish(self.sid, self.error)
@@ -184,6 +261,7 @@ class DeviceService:
                 self.state = "disconnected"
                 self.error = None
             log.info("已断开 session=%s 未退出线程=%s", self.sid, stuck or "无")
+            self.notify()
             if stuck:
                 raise RuntimeError("、".join(stuck) + "仍在退出，不能开启新连接")
             return self.status()
@@ -193,3 +271,58 @@ class DeviceService:
             self.disconnect()
         finally:
             self.store.close()
+
+
+class ConnectionManager:
+    """Several simultaneous connections share one store; `default` keeps the legacy single-connection API."""
+
+    def __init__(self, store):
+        self.store = store
+        self._lock = threading.RLock()
+        self._items = {}
+        self.default = DeviceService(store)
+
+    def add(self, service):
+        with self._lock:
+            self._items[service.cid] = service
+
+    def get(self, cid):
+        with self._lock:
+            return self._items.get(cid)
+
+    def remove(self, cid):
+        with self._lock:
+            return self._items.pop(cid, None)
+
+    def items(self):
+        with self._lock:
+            return list(self._items.values())
+
+    def by_session(self, sid):
+        if not sid:
+            return None
+        for service in self.items():
+            if service.sid == sid:
+                return service
+        return self.default if self.default.sid == sid else None
+
+    def list(self):
+        return [self.describe(service) for service in self.items()]
+
+    @staticmethod
+    def describe(service):
+        state = service.status()
+        return {"id": service.cid, "label": describe_target(state["config"] or {}), **state}
+
+    def close_all(self):
+        for service in self.items():
+            try:
+                service.disconnect()
+            except Exception:
+                log.warning("关闭连接失败 cid=%s", service.cid, exc_info=True)
+        with self._lock:
+            self._items.clear()
+        try:
+            self.default.disconnect()
+        except Exception:
+            log.warning("关闭默认连接失败", exc_info=True)

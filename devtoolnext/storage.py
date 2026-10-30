@@ -9,6 +9,13 @@ import uuid
 from pathlib import Path
 
 
+def public_config(config):
+    """Config as stored or shown: never persist or expose credentials."""
+    clean = dict(config or {})
+    clean.pop("password", None)
+    return clean
+
+
 class SessionStore:
     def __init__(self, root: Path):
         root.mkdir(parents=True, exist_ok=True)
@@ -46,19 +53,67 @@ class SessionStore:
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, config TEXT NOT NULL,
                 created REAL NOT NULL, used REAL NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS presets_config ON presets(config);
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         # A previous process that did not finish leaves an explicit incomplete session.
         self.db.execute("UPDATE sessions SET ended=?, error=COALESCE(error, ?) WHERE ended IS NULL",
                         (time.time(), "上次进程异常退出，末尾数据可能不完整"))
         self.db.commit()
+        self.prune_sessions()
 
-    def begin(self, config):
-        sid = uuid.uuid4().hex
+    def prune_sessions(self, keep=20):
+        """The JSONL files are the archive; the database only serves the live view."""
+        with self.lock, self.db:
+            kept = self.db.execute(
+                "SELECT id FROM sessions ORDER BY started DESC LIMIT ?", (keep,)).fetchall()
+            ids = [row[0] for row in kept]
+            if not ids:
+                return 0
+            marks = ",".join("?" * len(ids))
+            removed = self.db.execute(
+                f"DELETE FROM records WHERE session_id NOT IN ({marks})", ids).rowcount
+            self.db.execute(f"DELETE FROM sessions WHERE id NOT IN ({marks})", ids)
+            return removed
+
+    def begin(self, config, sid=None):
+        sid = sid or uuid.uuid4().hex
+        config = public_config(config)
         with self.lock:
             self.db.execute("INSERT INTO sessions(id, started, config) VALUES (?, ?, ?)",
                             (sid, time.time(), json.dumps(config)))
             self.db.commit()
         return sid
+
+    def get_setting(self, key, default=None):
+        with self.lock:
+            row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key, value):
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO settings(key, value) VALUES (?, ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+    def output_dir(self):
+        """Where per-session JSONL files are written; defaults to <data>/logs."""
+        value = self.get_setting("output_dir")
+        return Path(value) if value else self.root / "logs"
+
+    def set_output_dir(self, value):
+        path = Path(os.path.expanduser(str(value).strip()))
+        if not path.is_absolute():
+            raise ValueError("请填写绝对路径，例如 D:\\DevToolNext\\logs")
+        if len(str(path)) > 200:
+            raise ValueError("路径过长，请换一个更短的目录")
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".dtn-write-probe"
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError as exc:
+            raise ValueError(f"目录不可写：{exc}") from exc
+        self.set_setting("output_dir", str(path))
+        return path
 
     def append_batch(self, batch):
         with self.lock:
@@ -86,6 +141,7 @@ class SessionStore:
         return json.dumps(config, sort_keys=True, ensure_ascii=False)
 
     def save_preset(self, config, name=None):
+        config = public_config(config)
         key = self.preset_key(config)
         label = (name or "").strip() or "{} · {}".format(
             config.get("port", "未知端口"), config.get("baudrate", ""))
@@ -113,6 +169,12 @@ class SessionStore:
                 "SELECT id, started, ended, config, complete, error FROM sessions ORDER BY started DESC LIMIT 100").fetchall()
         return [dict(id=r[0], started=r[1], ended=r[2], config=json.loads(r[3]),
                      complete=bool(r[4]), error=r[5]) for r in rows]
+
+    def max_id(self, sid):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT COALESCE(MAX(id),0) FROM records WHERE session_id=?", (sid,)).fetchone()
+        return row[0] if row else 0
 
     def exists(self, sid):
         with self.lock:

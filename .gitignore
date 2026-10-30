@@ -12,6 +12,8 @@ dist/
 dist-next/
 *.spec
 data/
+/logs/
+tokens.json
 recordings/
 sessions/
 exports/

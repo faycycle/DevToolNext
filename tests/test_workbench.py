@@ -1,6 +1,8 @@
 import base64
 import json
 import time
+from pathlib import Path
+
 import pytest
 
 from fastapi.testclient import TestClient
@@ -148,6 +150,111 @@ def test_connection_presets_are_recorded_deduplicated_and_removable(tmp_path):
         remaining = client.get("/api/presets", headers=VIEW).json()
         assert len(remaining) == 1 and remaining[0]["config"]["baudrate"] == 115200
         assert client.get("/api/status", headers=CONTROL).json()["presets"][0]["config"]["port"] == "loop://"
+
+
+def test_session_writes_readable_log_and_raw_jsonl(tmp_path):
+    app = create_app(tmp_path, "controller", "observer")
+    with TestClient(app) as client:
+        target = tmp_path / "my-logs"
+        saved = client.post("/api/settings", headers=CONTROL, json={"output_dir": str(target)})
+        assert saved.status_code == 200 and saved.json()["output_dir"] == str(target)
+        assert client.get("/api/settings", headers=VIEW).json()["output_dir"] == str(target)
+        connection = client.post("/api/connect", headers=CONTROL, json={"port": "loop://"}).json()
+        log_path = Path(connection["log_file"])
+        assert log_path.parent == target and log_path.suffix == ".log"
+        client.post("/api/send", headers=CONTROL, json={"data": "hello", "ending": ""})
+        client.post("/api/disconnect", headers=CONTROL, json={})
+        text = log_path.read_text(encoding="utf-8")
+        assert text.startswith("# DevToolNext")
+        assert "TX  hello" in text and "RX  hello" in text
+        assert text.rstrip().splitlines()[-1].startswith("# ended:")
+        assert "complete=true" in text
+        raw = log_path.with_suffix(".jsonl")
+        assert raw.exists()
+        rows = [json.loads(line) for line in raw.read_text(encoding="utf-8").splitlines()]
+        assert rows[0]["type"] == "session" and rows[0]["session_id"] == connection["session_id"]
+        assert rows[-1]["type"] == "end" and rows[-1]["complete"] is True
+        sent = b"".join(base64.b64decode(row["data_base64"]) for row in rows
+                        if row.get("direction") == "tx")
+        assert sent == b"hello"
+        assert client.get("/api/status", headers=VIEW).json()["log_file"] == str(log_path)
+
+
+def test_live_endpoint_returns_new_records_immediately(tmp_path):
+    with TestClient(create_app(tmp_path, "controller", "observer")) as client:
+        sid = client.post("/api/connect", headers=CONTROL,
+                          json={"port": "loop://"}).json()["session_id"]
+        client.post("/api/send", headers=CONTROL, json={"data": "live", "ending": ""})
+        started = time.monotonic()
+        page = client.get(f"/api/sessions/{sid}/records/live?after=0&timeout=5",
+                          headers=VIEW).json()
+        assert time.monotonic() - started < 2
+        assert page["state"] == "connected"
+        sent = b"".join(base64.b64decode(row["data_base64"]) for row in page["records"]
+                        if row["direction"] == "tx")
+        assert sent == b"live"
+        waited = time.monotonic()
+        empty = client.get(f"/api/sessions/{sid}/records/live?after={page['next_cursor']}&timeout=1",
+                           headers=VIEW).json()
+        assert empty["records"] == []
+        assert time.monotonic() - waited >= 0.9
+
+
+def test_settings_validate_path_and_role(tmp_path):
+    with TestClient(create_app(tmp_path, "controller", "observer")) as client:
+        assert client.post("/api/settings", headers=CONTROL,
+                           json={"output_dir": "logs"}).status_code == 400
+        assert client.post("/api/settings", headers=VIEW,
+                           json={"output_dir": str(tmp_path)}).status_code == 403
+        assert client.get("/api/settings", headers=VIEW).json()["output_dir"].endswith("logs")
+
+
+def test_line_control_needs_connection_and_control_role(tmp_path):
+    with TestClient(create_app(tmp_path, "controller", "observer")) as client:
+        assert client.post("/api/lines", headers=CONTROL, json={"dtr": True}).status_code == 409
+        client.post("/api/connect", headers=CONTROL, json={"port": "loop://"})
+        assert client.post("/api/lines", headers=VIEW, json={"dtr": True}).status_code == 403
+        lines = client.post("/api/lines", headers=CONTROL, json={"dtr": False}).json()
+        assert lines["dtr"] is False and lines["rts"] is True
+        status = client.get("/api/status", headers=CONTROL).json()
+        assert status["dtr"] is False and status["rts"] is True
+
+
+def test_multiple_connections_are_independent(tmp_path):
+    with TestClient(create_app(tmp_path, "controller", "observer")) as client:
+        first = client.post("/api/connections", headers=CONTROL, json={"port": "loop://"}).json()
+        second = client.post("/api/connections", headers=CONTROL, json={"port": "loop://"}).json()
+        assert first["id"] != second["id"]
+        assert first["session_id"] != second["session_id"]
+        assert len(client.get("/api/connections", headers=VIEW).json()["connections"]) == 2
+        client.post(f"/api/connections/{first['id']}/send", headers=CONTROL,
+                    json={"data": "one", "ending": ""})
+        client.post(f"/api/connections/{second['id']}/send", headers=CONTROL,
+                    json={"data": "two", "ending": ""})
+        time.sleep(0.3)
+
+        def sent(sid):
+            page = client.get(f"/api/sessions/{sid}/records", headers=VIEW).json()
+            return b"".join(base64.b64decode(row["data_base64"]) for row in page["records"]
+                            if row["direction"] == "tx")
+
+        assert sent(first["session_id"]) == b"one"
+        assert sent(second["session_id"]) == b"two"
+        assert client.delete(f"/api/connections/{first['id']}", headers=CONTROL).status_code == 200
+        left = client.get("/api/connections", headers=VIEW).json()["connections"]
+        assert len(left) == 1 and left[0]["id"] == second["id"]
+        assert left[0]["state"] == "connected"
+
+
+def test_credentials_never_reach_storage(tmp_path):
+    store = SessionStore(tmp_path)
+    try:
+        store.begin({"type": "ssh", "port": "host", "username": "u", "password": "secret"})
+        assert "secret" not in json.dumps(store.sessions()[0]["config"])
+        store.save_preset({"type": "ssh", "port": "host", "password": "secret"})
+        assert "secret" not in json.dumps(store.presets())
+    finally:
+        store.close()
 
 
 def test_second_process_cannot_recover_a_live_store(tmp_path):
